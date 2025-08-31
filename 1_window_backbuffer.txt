@@ -1,0 +1,95 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#include <stdint.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* -------------------------------- Basic types ----------------------------- */
+typedef uint8_t u8; 
+typedef uint32_t u32; 
+typedef int32_t i32; 
+typedef float f32; 
+typedef double f64;
+
+#ifndef bool
+#define bool int
+#define true 1
+#define false 0
+#endif
+
+/* -------------------------------- Backbuffer ------------------------------ */
+typedef struct { int width, height, pitch; void* memory; BITMAPINFO bmi; } Backbuffer;
+static Backbuffer g_back;
+static int g_running = 1;
+
+static void ResizeBackbuffer(Backbuffer* bb, int w, int h) {
+	if (w < 1) w = 1; if (h < 1) h = 1;
+	if (bb->memory) { VirtualFree(bb->memory, 0, MEM_RELEASE); bb->memory = 0; }
+	bb->width = w; bb->height = h; bb->pitch = w * 4;
+	ZeroMemory(&bb->bmi, sizeof(bb->bmi));
+	bb->bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bb->bmi.bmiHeader.biWidth = w; bb->bmi.bmiHeader.biHeight = -h; /* top-down */
+	bb->bmi.bmiHeader.biPlanes = 1; bb->bmi.bmiHeader.biBitCount = 32; bb->bmi.bmiHeader.biCompression = BI_RGB;
+	bb->memory = VirtualAlloc(0, bb->pitch * h, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+
+
+static void PresentBackbuffer(HDC dc, Backbuffer* bb) {
+	StretchDIBits(dc, 0, 0, bb->width, bb->height, 0, 0, bb->width, bb->height,
+		bb->memory, &bb->bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+
+static void Clear(u32 color) {
+	int y; u32* row = (u32*)g_back.memory;
+	for (y = 0; y < g_back.height; y++) {
+		int x; for (x = 0; x < g_back.width; x++) row[x] = color;
+		row = (u32*)((u8*)row + g_back.pitch);
+	}
+}
+
+
+/* ------------------------- Win32 Plumbing ---------------------------------*/
+
+static HWND g_hWnd; 
+
+static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
+	switch (msg) {
+	case WM_SIZE: ResizeBackbuffer(&g_back, LOWORD(l), HIWORD(l)); return 0;
+	case WM_CLOSE: case WM_DESTROY: g_running = 0; PostQuitMessage(0); return 0;
+	default: return DefWindowProc(hWnd, msg, w, l);
+	}
+}
+
+int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+	
+	WNDCLASS wc; 
+	ZeroMemory(&wc, sizeof(wc)); 
+	wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+	wc.lpfnWndProc = WndProc; 
+	wc.hInstance = hInst; 
+	wc.lpszClassName = "Portal FPS"; 
+	
+	RegisterClass(&wc);
+	g_hWnd = CreateWindowEx(
+		0, wc.lpszClassName, "Portal FPS", 
+		WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+		CW_USEDEFAULT, CW_USEDEFAULT, 960, 540, 
+		0, 0, hInst, 0
+	);
+	
+	RECT r; 
+	GetClientRect(g_hWnd, &r); 	
+	ResizeBackbuffer(&g_back, r.right - r.left, r.bottom - r.top);
+
+	while (g_running) {
+		MSG m; 
+		while (PeekMessage(&m, 0, 0, 0, PM_REMOVE)) { if (m.message == WM_QUIT) g_running = 0; else { TranslateMessage(&m); DispatchMessage(&m); } }
+		
+		if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) g_running = 0;
+		
+	}
+	return 0;
+}

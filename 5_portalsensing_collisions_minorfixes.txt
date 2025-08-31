@@ -1,0 +1,354 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#include <stdint.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* -------------------------------- Basic types ----------------------------- */
+typedef uint8_t  u8;
+typedef uint32_t u32;
+typedef int32_t  i32;
+typedef float    f32;
+typedef double   f64;
+
+#ifndef bool
+#define bool int
+#define true 1
+#define false 0
+#endif
+
+/* -------------------------------- Backbuffer ------------------------------ */
+typedef struct { int width, height, pitch; void* memory; BITMAPINFO bmi; } Backbuffer;
+static Backbuffer g_back;
+static int g_running = 1;
+
+/* ------------------------- Player / Camera -------------------------------- */
+typedef struct {
+    f32 x, z;                 /* position on ground plane */
+    f32 yaw;                  /* radians, 0 = +X, CCW */
+    f32 move_speed_mps;       /* speed units per second */
+    f32 mouse_sens_rad_per_px;/* yaw radians per mouse pixel */
+} Player;
+
+static Player g_player = { -2.0f, 0.0f, 0.0f, 3.0f, 0.0020f };
+static bool   g_mouse_captured = false;
+
+/* ------------------------------ Backbuffer -------------------------------- */
+static void ResizeBackbuffer(Backbuffer* bb, int w, int h) {
+    if (w < 1) w = 1; if (h < 1) h = 1;
+    if (bb->memory) { VirtualFree(bb->memory, 0, MEM_RELEASE); bb->memory = 0; }
+    bb->width = w; bb->height = h; bb->pitch = w * 4;
+    ZeroMemory(&bb->bmi, sizeof(bb->bmi));
+    bb->bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bb->bmi.bmiHeader.biWidth = w; bb->bmi.bmiHeader.biHeight = -h; /* top-down */
+    bb->bmi.bmiHeader.biPlanes = 1; bb->bmi.bmiHeader.biBitCount = 32; bb->bmi.bmiHeader.biCompression = BI_RGB;
+    bb->memory = VirtualAlloc(0, bb->pitch * h, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+
+static void PresentBackbuffer(HDC dc, Backbuffer* bb) {
+    StretchDIBits(dc, 0, 0, bb->width, bb->height, 0, 0, bb->width, bb->height,
+        bb->memory, &bb->bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+static void Clear(u32 color) {
+    int y; u32* row = (u32*)g_back.memory;
+    for (y = 0; y < g_back.height; y++) {
+        int x; for (x = 0; x < g_back.width; x++) row[x] = color;
+        row = (u32*)((u8*)row + g_back.pitch);
+    }
+}
+
+/* ---------- Tiny raster helpers ------------------------------------------ */
+static void PutPixel(int x, int y, u32 color) {
+    if ((unsigned)x < (unsigned)g_back.width && (unsigned)y < (unsigned)g_back.height) {
+        u8* row = (u8*)g_back.memory + y * g_back.pitch;
+        ((u32*)row)[x] = color;
+    }
+}
+static void DrawLine(int x0, int y0, int x1, int y1, u32 color) {
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int dy = (y1 > y0) ? (y0 - y1) : (y1 - y0); /* dy negative */
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        PutPixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+static void FillRect(int x, int y, int w, int h, u32 color) {
+    if (w <= 0 || h <= 0) return;
+    int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > g_back.width)  x1 = g_back.width;
+    if (y1 > g_back.height) y1 = g_back.height;
+    for (int yy = y0; yy < y1; ++yy) {
+        u32* row = (u32*)((u8*)g_back.memory + yy * g_back.pitch);
+        for (int xx = x0; xx < x1; ++xx) row[xx] = color;
+    }
+}
+
+/* ------------------------- Win32 Plumbing ---------------------------------*/
+static HWND g_hWnd;
+static HDC  g_hdc;
+static LARGE_INTEGER g_qpcFreq;
+
+static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_SIZE:    ResizeBackbuffer(&g_back, LOWORD(l), HIWORD(l)); return 0;
+    case WM_CLOSE:
+    case WM_DESTROY: g_running = 0; PostQuitMessage(0); return 0;
+    default:         return DefWindowProc(hWnd, msg, w, l);
+    }
+}
+
+/* ------------------------- Mouse capture helpers -------------------------- */
+static void CaptureMouse(HWND hwnd) {
+    RECT cr; GetClientRect(hwnd, &cr);
+    POINT c = { (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+    ClientToScreen(hwnd, &c);
+    SetCursorPos(c.x, c.y);
+    ShowCursor(FALSE);
+    g_mouse_captured = true;
+}
+static void ReleaseMouse(void) {
+    ShowCursor(TRUE);
+    g_mouse_captured = false;
+}
+static f32 GetMouseDeltaXAndRecenter(HWND hwnd) {
+    if (!g_mouse_captured) return 0.0f;
+    RECT cr; GetClientRect(hwnd, &cr);
+    POINT center = { (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+    POINT center_screen = center; ClientToScreen(hwnd, &center_screen);
+    POINT p; GetCursorPos(&p);
+    f32 dx = (f32)(p.x - center_screen.x);
+    SetCursorPos(center_screen.x, center_screen.y);
+    return dx;
+}
+
+/* ------------------------- Input (movement intent) ------------------------ */
+static void UpdatePlayerIntent(f32 dt, f32* out_dx, f32* out_dz) {
+    /* Mouse look */
+    f32 mouse_dx = GetMouseDeltaXAndRecenter(g_hWnd);
+    g_player.yaw += mouse_dx * g_player.mouse_sens_rad_per_px;
+    while (g_player.yaw < 0.0f)               g_player.yaw += (f32)(2.0 * M_PI);
+    while (g_player.yaw >= (f32)(2.0 * M_PI)) g_player.yaw -= (f32)(2.0 * M_PI);
+
+    /* Keyboard */
+    int w = (GetAsyncKeyState('W') & 0x8000) ? 1 : 0;
+    int s = (GetAsyncKeyState('S') & 0x8000) ? 1 : 0;
+    int a = (GetAsyncKeyState('A') & 0x8000) ? 1 : 0;
+    int d = (GetAsyncKeyState('D') & 0x8000) ? 1 : 0;
+
+    f32 forward = (f32)(w - s);
+    f32 strafe = (f32)(a - d);
+
+    f32 cosY = (f32)cos(g_player.yaw);
+    f32 sinY = (f32)sin(g_player.yaw);
+
+    f32 vx = forward * cosY + strafe * (-sinY);
+    f32 vz = forward * sinY + strafe * (cosY);
+
+    f32 len2 = vx * vx + vz * vz;
+    if (len2 > 0.000001f) {
+        f32 invLen = 1.0f / (f32)sqrt(len2);
+        vx *= invLen; vz *= invLen;
+        f32 step = g_player.move_speed_mps * dt;
+        *out_dx = vx * step;
+        *out_dz = vz * step;
+    }
+    else {
+        *out_dx = 0.0f; *out_dz = 0.0f;
+    }
+}
+
+/* ------------------------- Portal map ------------------------------------ */
+typedef struct { f32 x, z; } V2;
+typedef struct { V2 a, b; int neighbor; } Wall; /* neighbor -1 = solid; >=0 = portal */
+typedef struct { int first_wall; int wall_count; } Sector;
+
+/* Two rooms */
+static Wall g_walls[] = {
+    /* Sector 0: [-4,-3]..[4,3], door on right edge z in [-0.5,0.5] */
+    {{-4,-3},{-4, 3},-1},
+    {{-4, 3},{ 4, 3},-1},
+    {{ 4, 3},{ 4, 0.5f},-1},
+    {{ 4, 0.5f},{ 4,-0.5f}, 1}, /* portal -> sector 1 */
+    {{ 4,-0.5f},{ 4,-3},-1},
+    {{ 4,-3},{-4,-3},-1},
+
+    /* Sector 1: [4,-2]..[10,2], matching door on left */
+    {{ 4, 2},{ 4, 0.5f},-1},
+    {{ 4, 0.5f},{ 4,-0.5f}, 0}, /* portal -> sector 0 */
+    {{ 4,-0.5f},{ 4,-2},-1},
+    {{ 4,-2},{10,-2},-1},
+    {{10,-2},{10, 2},-1},
+    {{10, 2},{ 4, 2},-1},
+};
+static Sector g_sectors[] = {
+    { 0, 6 },
+    { 6, 6 },
+};
+static int g_current_sector = 0;
+
+/* ------------------------- Geometry helpers ------------------------------- */
+static V2 V2Sub(V2 a, V2 b) { V2 r = { a.x - b.x, a.z - b.z }; return r; }
+static f32 Cross2(V2 a, V2 b) { return a.x * b.z - a.z * b.x; }
+
+/* Returns 1 if segments p->q and a->b intersect; if so, fills tHit in [0,1] along p->q */
+static int SegmentIntersectParam(V2 p, V2 q, V2 a, V2 b, f32* tHit, f32* uHit) {
+    V2 r = V2Sub(q, p);
+    V2 s = V2Sub(b, a);
+    f32 denom = Cross2(r, s);
+    if (fabsf(denom) < 1e-6f) return 0; /* parallel or collinear (ignore for now) */
+    V2 qp = V2Sub(a, p);
+    f32 t = Cross2(qp, s) / denom;
+    f32 u = Cross2(qp, r) / denom;
+    if (t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f) {
+        if (tHit) *tHit = t;
+        if (uHit) *uHit = u;
+        return 1;
+    }
+    return 0;
+}
+
+/* Tries to move from oldP to newP within current sector:
+   - Blocks on solid walls (stay at oldP)
+   - If the earliest hit is a portal, allow move and switch sector
+*/
+static void MoveWithPortals(V2 oldP, V2 newP) {
+    Sector sec = g_sectors[g_current_sector];
+
+    f32 bestT = 2.0f;      /* >1 means no hit yet */
+    int  bestWallIdx = -1; /* which wall we hit first */
+    for (int i = 0; i < sec.wall_count; ++i) {
+        Wall w = g_walls[sec.first_wall + i];
+        f32 t, u;
+        if (SegmentIntersectParam(oldP, newP, w.a, w.b, &t, &u)) {
+            if (t < bestT) { bestT = t; bestWallIdx = sec.first_wall + i; }
+        }
+    }
+
+    if (bestWallIdx < 0) {
+        /* No hit, free move */
+        g_player.x = newP.x; g_player.z = newP.z;
+        return;
+    }
+
+    Wall hit = g_walls[bestWallIdx];
+    if (hit.neighbor >= 0) {
+        /* Hit a portal first: allow full move and switch sectors */
+        g_player.x = newP.x; g_player.z = newP.z;
+        g_current_sector = hit.neighbor;
+    }
+    else {
+        /* Hit a solid wall first: block (stay at old position) */
+        g_player.x = oldP.x; g_player.z = oldP.z;
+    }
+}
+
+/* ------------------------- Map overlay ------------------------------------ */
+static void DrawMap2D(void) {
+    const int origin_x = 100;
+    const int origin_y = (g_back.height - 30) - 50;
+    const float S = 24.0f;
+
+    /* walls */
+    for (int s = 0; s < (int)(sizeof(g_sectors) / sizeof(g_sectors[0])); ++s) {
+        Sector sec = g_sectors[s];
+        for (int i = 0; i < sec.wall_count; ++i) {
+            Wall w = g_walls[sec.first_wall + i];
+            int x0 = origin_x + (int)(w.a.x * S);
+            int y0 = origin_y - (int)(w.a.z * S);
+            int x1 = origin_x + (int)(w.b.x * S);
+            int y1 = origin_y - (int)(w.b.z * S);
+            u32 color = (w.neighbor >= 0) ? 0x0044CCFFu : 0x00FF4444u;
+            DrawLine(x0, y0, x1, y1, color);
+        }
+    }
+
+    /* player */
+    int px = origin_x + (int)(g_player.x * S);
+    int pz = origin_y - (int)(g_player.z * S);
+    u32 pcol = (g_current_sector == 0) ? 0x00FFAA00u : 0x0000FFFFu; /* amber or cyan */
+    FillRect(px - 2, pz - 2, 5, 5, pcol);
+
+    /* heading tick */
+    int hx = origin_x + (int)((g_player.x + cosf(g_player.yaw) * 0.5f) * S);
+    int hz = origin_y - (int)((g_player.z + sinf(g_player.yaw) * 0.5f) * S);
+    DrawLine(px, pz, hx, hz, 0x0000FF00u);
+}
+
+/* ------------------------- Debug HUD -------------------------------------- */
+static void DrawDebugHUD(void) {
+    int cx = g_back.width / 2, cy = g_back.height / 2;
+    FillRect(cx - 2, cy - 2, 5, 5, 0x00FFFFFF);
+    DrawMap2D();
+}
+
+/* --------------------------------- WinMain -------------------------------- */
+int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+    WNDCLASS wc; ZeroMemory(&wc, sizeof(wc));
+    wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = "Portal FPS";
+
+    RegisterClass(&wc);
+    g_hWnd = CreateWindowEx(
+        0, wc.lpszClassName, "Portal FPS",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 960, 540,
+        0, 0, hInst, 0
+    );
+
+    RECT r; GetClientRect(g_hWnd, &r);
+    ResizeBackbuffer(&g_back, r.right - r.left, r.bottom - r.top);
+
+    g_hdc = GetDC(g_hWnd);
+    QueryPerformanceFrequency(&g_qpcFreq);
+    LARGE_INTEGER last; QueryPerformanceCounter(&last);
+
+    while (g_running) {
+        MSG m;
+        while (PeekMessage(&m, 0, 0, 0, PM_REMOVE)) {
+            if (m.message == WM_QUIT) g_running = 0;
+            else { TranslateMessage(&m); DispatchMessage(&m); }
+        }
+        if (!g_running) break;
+
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            g_running = 0;
+        }
+
+        if (!g_mouse_captured) {
+            SHORT lmb = GetAsyncKeyState(VK_LBUTTON);
+            if (lmb & 0x0001) { CaptureMouse(g_hWnd); }
+        }
+
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        f32 dt = (f32)((double)(now.QuadPart - last.QuadPart) / (double)g_qpcFreq.QuadPart);
+        last = now;
+
+        /* Input -> desired delta, then collide/traverse */
+        f32 dx = 0.0f, dz = 0.0f;
+        UpdatePlayerIntent(dt, &dx, &dz);
+        V2 oldP = { g_player.x, g_player.z };
+        V2 newP = { g_player.x + dx, g_player.z + dz };
+        MoveWithPortals(oldP, newP);
+
+        Clear(0x00202020);
+        DrawDebugHUD();
+        PresentBackbuffer(g_hdc, &g_back);
+    }
+
+    ReleaseMouse();
+    ReleaseDC(g_hWnd, g_hdc);
+    return 0;
+}
