@@ -1,0 +1,794 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#include <stdint.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* -------------------------------- Basic types ----------------------------- */
+typedef uint8_t  u8;
+typedef uint32_t u32;
+typedef int32_t  i32;
+typedef float    f32;
+typedef double   f64;
+
+#ifndef __cplusplus
+#ifndef bool
+#define bool int
+#define true 1
+#define false 0
+#endif
+#endif
+
+/* -------------------------------- Backbuffer ------------------------------ */
+typedef struct { int width, height, pitch; void* memory; BITMAPINFO bmi; } Backbuffer;
+static Backbuffer g_back;
+static int g_running = 1;
+
+/* ------------------------- Player / Camera -------------------------------- */
+typedef struct {
+    f32 x, z;                  /* position on ground plane */
+    f32 yaw;                   /* radians, 0 = +X, CCW */
+    f32 move_speed_mps;        /* speed units per second */
+    f32 mouse_sens_rad_per_px; /* yaw radians per mouse pixel */
+    f32 radius;                /* collision radius (units) */
+    f32 eye_y;                 /* eye height above floor */
+} Player;
+
+static Player g_player = { 2.0f, 2.0f, 0.0f, 3.0f, 0.0020f, 0.20f, 1.0f };
+static bool   g_mouse_captured = false;
+
+/* ------------------------------ Backbuffer -------------------------------- */
+static void ResizeBackbuffer(Backbuffer* bb, int w, int h) {
+    if (w < 1) w = 1; if (h < 1) h = 1;
+    if (bb->memory) { VirtualFree(bb->memory, 0, MEM_RELEASE); bb->memory = 0; }
+    bb->width = w; bb->height = h; bb->pitch = w * 4;
+    ZeroMemory(&bb->bmi, sizeof(bb->bmi));
+    bb->bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bb->bmi.bmiHeader.biWidth = w; bb->bmi.bmiHeader.biHeight = -h; /* top-down */
+    bb->bmi.bmiHeader.biPlanes = 1; bb->bmi.bmiHeader.biBitCount = 32; bb->bmi.bmiHeader.biCompression = BI_RGB;
+    bb->memory = VirtualAlloc(0, bb->pitch * h, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+static void PresentBackbuffer(HDC dc, Backbuffer* bb) {
+    StretchDIBits(dc, 0, 0, bb->width, bb->height, 0, 0, bb->width, bb->height,
+        bb->memory, &bb->bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+static void Clear(u32 color) {
+    int y; u32* row = (u32*)g_back.memory;
+    for (y = 0; y < g_back.height; y++) {
+        int x; for (x = 0; x < g_back.width; x++) row[x] = color;
+        row = (u32*)((u8*)row + g_back.pitch);
+    }
+}
+
+/* ---------- Tiny raster helpers ------------------------------------------ */
+static void PutPixel(int x, int y, u32 color) {
+    if ((unsigned)x < (unsigned)g_back.width && (unsigned)y < (unsigned)g_back.height) {
+        u8* row = (u8*)g_back.memory + y * g_back.pitch;
+        ((u32*)row)[x] = color;
+    }
+}
+static void DrawLine(int x0, int y0, int x1, int y1, u32 color) {
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int dy = (y1 > y0) ? (y0 - y1) : (y1 - y0); /* dy negative */
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        PutPixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        {
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    }
+}
+static void FillRect(int x, int y, int w, int h, u32 color) {
+    int xx, yy;
+    if (w <= 0 || h <= 0) return;
+    {
+        int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        if (x1 > g_back.width)  x1 = g_back.width;
+        if (y1 > g_back.height) y1 = g_back.height;
+        for (yy = y0; yy < y1; ++yy) {
+            u32* row = (u32*)((u8*)g_back.memory + yy * g_back.pitch);
+            for (xx = x0; xx < x1; ++xx) row[xx] = color;
+        }
+    }
+}
+static inline u32 ShadeRGB(u32 c, float f) {
+    int r, g, b;
+    if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;
+    r = (c >> 16) & 255; g = (c >> 8) & 255; b = c & 255;
+    r = (int)(r * f); g = (int)(g * f); b = (int)(b * f);
+    return (u32)((r << 16) | (g << 8) | b);
+}
+/* Vertical span at x */
+static void DrawVerticalSpan(int x, int y1, int y2, u32 color) {
+    int y;
+    if (x < 0 || x >= g_back.width) return;
+    if (y1 > y2) { int t = y1; y1 = y2; y2 = t; }
+    if (y2 < 0 || y1 >= g_back.height) return;
+    if (y1 < 0) y1 = 0;
+    if (y2 >= g_back.height) y2 = g_back.height - 1;
+    for (y = y1; y <= y2; ++y) {
+        u32* row = (u32*)((u8*)g_back.memory + y * g_back.pitch);
+        row[x] = color;
+    }
+}
+
+/* ------------------------- Win32 Plumbing ---------------------------------*/
+static HWND g_hWnd;
+static HDC  g_hdc;
+static LARGE_INTEGER g_qpcFreq;
+
+static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_SIZE:    ResizeBackbuffer(&g_back, LOWORD(l), HIWORD(l)); return 0;
+    case WM_CLOSE:
+    case WM_DESTROY: g_running = 0; PostQuitMessage(0); return 0;
+    default:         return DefWindowProc(hWnd, msg, w, l);
+    }
+}
+
+/* ------------------------- Mouse capture helpers -------------------------- */
+static void CaptureMouse(HWND hwnd) {
+    RECT cr; POINT c;
+    GetClientRect(hwnd, &cr);
+    c.x = (cr.right - cr.left) / 2;
+    c.y = (cr.bottom - cr.top) / 2;
+    ClientToScreen(hwnd, &c);
+    SetCursorPos(c.x, c.y);
+    ShowCursor(FALSE);
+    g_mouse_captured = true;
+}
+static void ReleaseMouse(void) {
+    ShowCursor(TRUE);
+    g_mouse_captured = false;
+}
+static f32 GetMouseDeltaXAndRecenter(HWND hwnd) {
+    if (!g_mouse_captured) return 0.0f;
+    {
+        RECT cr;
+        POINT center, center_screen, p;
+        GetClientRect(hwnd, &cr);
+        center.x = (cr.right - cr.left) / 2;
+        center.y = (cr.bottom - cr.top) / 2;
+        center_screen = center; ClientToScreen(hwnd, &center_screen);
+        GetCursorPos(&p);
+        {
+            f32 dx = (f32)(p.x - center_screen.x);
+            SetCursorPos(center_screen.x, center_screen.y);
+            return dx;
+        }
+    }
+}
+
+/* ------------------------- Input (movement intent) ------------------------ */
+static void UpdatePlayerIntent(f32 dt, f32* out_dx, f32* out_dz) {
+    /* Mouse look */
+    f32 mouse_dx = GetMouseDeltaXAndRecenter(g_hWnd);
+    g_player.yaw += mouse_dx * g_player.mouse_sens_rad_per_px;
+    while (g_player.yaw < 0.0f)               g_player.yaw += (f32)(2.0f * (f32)M_PI);
+    while (g_player.yaw >= (f32)(2.0f * (f32)M_PI)) g_player.yaw -= (f32)(2.0f * (f32)M_PI);
+
+    /* Keyboard */
+    {
+        int w = (GetAsyncKeyState('W') & 0x8000) ? 1 : 0;
+        int s = (GetAsyncKeyState('S') & 0x8000) ? 1 : 0;
+        int a = (GetAsyncKeyState('A') & 0x8000) ? 1 : 0;
+        int d = (GetAsyncKeyState('D') & 0x8000) ? 1 : 0;
+
+        f32 forward = (f32)(w - s);
+        f32 strafe = (f32)(d - a);
+
+        f32 cosY = (f32)cos(g_player.yaw);
+        f32 sinY = (f32)sin(g_player.yaw);
+
+        f32 vx = forward * cosY + strafe * (-sinY);
+        f32 vz = forward * sinY + strafe * (cosY);
+
+        f32 len2 = vx * vx + vz * vz;
+        if (len2 > 0.000001f) {
+            f32 invLen = 1.0f / (f32)sqrt(len2);
+            f32 step = g_player.move_speed_mps * dt;
+            vx *= invLen; vz *= invLen;
+            *out_dx = vx * step;
+            *out_dz = vz * step;
+        }
+        else {
+            *out_dx = 0.0f; *out_dz = 0.0f;
+        }
+    }
+}
+
+/* ------------------------- Portal map ------------------------------------ */
+typedef struct { f32 x, z; } V2;
+typedef struct { V2 a, b; int neighbor; } Wall;   /* neighbor -1 = solid; >=0 = portal */
+typedef struct { int first_wall; int wall_count; f32 floor_y; f32 ceil_y; } Sector;
+
+/* CCW winding, exact reversed portal edge between 0 and 1 */
+static Wall g_walls[] = {
+    /* ---------------- Sector 0 (6 walls) ---------------- */
+    {{ 0, 0}, { 0, 4}, -1},   /* 0: left, up */
+    {{ 0, 4}, { 2, 4}, -1},   /* 1: top-left solid */
+    {{ 2, 4}, { 3, 4},  1},   /* 2: TOP DOOR portal to Sector 1 */
+    {{ 3, 4}, { 4, 4}, -1},   /* 3: top-right solid */
+    {{ 4, 4}, { 4, 0}, -1},   /* 4: right, down (REVERSED to keep CCW) */
+    {{ 4, 0}, { 0, 0}, -1},   /* 5: bottom, left (REVERSED to keep CCW) */
+
+    /* ---------------- Sector 1: hallway x in [2,3], z in [4,8] ----------------
+       CCW order around interior
+       Left  : (2,4)->(2,8)
+       Top   : (2,8)->(3,8)
+       Right : (3,8)->(3,4)
+       Bottom: (3,4)->(2,4)  <-- portal back to Sector 0 (reversed of wall 2)
+    */
+    {{ 2, 4}, { 2, 8}, -1},   /* 6: left, up */
+    {{ 2, 8}, { 3, 8}, 2},   /* 7: top, right */
+    {{ 3, 8}, { 3, 4}, -1},   /* 8: right, down */
+    {{ 3, 4}, { 2, 4},  0},   /* 9: bottom portal to Sector 0 (reversed of wall 2) */
+
+    /* Sector 2*/
+    {{2,8}, {2,10}, -1}, // 10
+    {{2, 10}, {7, 10}, -1}, // 11
+    {{7,10}, {8, 10}, -1 },// 12 will be a portal
+    {{8, 10}, {8, 8}, -1 }, // 13 
+    {{8, 8}, {3, 8}, -1}, // 14 
+    {{3, 8}, {2, 8}, 1}, // 15
+};
+
+static Sector g_sectors[] = {
+    { 0, 6, 0.0f, 2.0f }, /* Sector 0: walls 0..5 */
+    { 6, 4, 0.0f, 2.0f }, /* Sector 1: walls 6..9 */
+    { 10, 6, 0.f, 2.0f }
+};
+
+static int g_current_sector = 0;
+
+/* --- per-sector winding detection (CCW or CW) --- */
+static int g_sector_is_ccw[64];
+
+static void InitSectorWinding(void) {
+    int nsecs = (int)(sizeof(g_sectors) / sizeof(g_sectors[0]));
+    int s;
+    for (s = 0; s < nsecs; ++s) {
+        Sector sec = g_sectors[s];
+        double area2 = 0.0;
+        int i;
+        for (i = 0; i < sec.wall_count; ++i) {
+            Wall w = g_walls[sec.first_wall + i];
+            area2 += (double)w.a.x * (double)w.b.z - (double)w.b.x * (double)w.a.z;
+        }
+        g_sector_is_ccw[s] = (area2 > 0.0) ? 1 : 0;  /* + => CCW, - => CW */
+    }
+}
+
+/* ------------------------- Geometry + collision helpers ------------------- */
+static V2 V2Sub(V2 a, V2 b) { V2 r; r.x = a.x - b.x; r.z = a.z - b.z; return r; }
+static V2 V2Add(V2 a, V2 b) { V2 r; r.x = a.x + b.x; r.z = a.z + b.z; return r; }
+static V2 V2Scale(V2 a, f32 s) { V2 r; r.x = a.x * s; r.z = a.z * s; return r; }
+static f32 Dot2(V2 a, V2 b) { return a.x * b.x + a.z * b.z; }
+static f32 Cross2(V2 a, V2 b) { return a.x * b.z - a.z * b.x; }
+
+static V2 ClosestPointOnSegment(V2 p, V2 a, V2 b) {
+    V2 ab = V2Sub(b, a);
+    f32 ab2 = Dot2(ab, ab);
+    f32 t;
+    if (ab2 <= 1e-12f) return a;
+    t = Dot2(V2Sub(p, a), ab) / ab2;
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    return V2Add(a, V2Scale(ab, t));
+}
+static int SegmentIntersectParam(V2 p, V2 q, V2 a, V2 b, f32* tHit, f32* uHit) {
+    V2 r = V2Sub(q, p);
+    V2 s = V2Sub(b, a);
+    f32 denom = Cross2(r, s);
+    V2 qp;
+    f32 t, u;
+    if (fabsf(denom) < 1e-6f) return 0;
+    qp = V2Sub(a, p);
+    t = Cross2(qp, s) / denom;
+    u = Cross2(qp, r) / denom;
+    if (t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f) {
+        if (tHit) *tHit = t;
+        if (uHit) *uHit = u;
+        return 1;
+    }
+    return 0;
+}
+
+/* Push out of solids to create sliding */
+static void ResolveCircleVsSolids(int sector_idx, V2* p, f32 radius) {
+    const int max_iters = 4;
+    const f32 EPS = 1e-4f;
+    int iter;
+    for (iter = 0; iter < max_iters; ++iter) {
+        int any_fix = 0;
+        Sector sec = g_sectors[sector_idx];
+        int i;
+        for (i = 0; i < sec.wall_count; ++i) {
+            Wall w = g_walls[sec.first_wall + i];
+            V2 cp, d;
+            f32 d2, r2, dlen, nlen2, push;
+            V2 n;
+            if (w.neighbor >= 0) continue; /* ignore portals */
+            cp = ClosestPointOnSegment(*p, w.a, w.b);
+            d = V2Sub(*p, cp);
+            d2 = Dot2(d, d);
+            r2 = radius * radius;
+            if (d2 < r2) {
+                dlen = sqrtf(d2);
+                if (dlen > 1e-6f) {
+                    n = V2Scale(d, 1.0f / dlen);
+                }
+                else {
+                    V2 e = V2Sub(w.b, w.a);
+                    n.x = -e.z; n.z = e.x;
+                    nlen2 = n.x * n.x + n.z * n.z;
+                    if (nlen2 > 0.0f) { f32 inv = 1.0f / sqrtf(nlen2); n.x *= inv; n.z *= inv; }
+                    else { n.x = 1.0f; n.z = 0.0f; }
+                }
+                push = (radius - dlen) + EPS;
+                *p = V2Add(*p, V2Scale(n, push));
+                any_fix = 1;
+            }
+        }
+        if (!any_fix) break;
+    }
+}
+
+static void MoveWithPortalsAndSlide(V2 oldP, V2 desiredP) {
+    Sector sec = g_sectors[g_current_sector];
+    f32 bestT = 2.0f;
+    int bestIdx = -1;
+    int i;
+    for (i = 0; i < sec.wall_count; ++i) {
+        int widx = sec.first_wall + i;
+        Wall w = g_walls[widx];
+        f32 t, u;
+        if (SegmentIntersectParam(oldP, desiredP, w.a, w.b, &t, &u)) {
+            if (t < bestT) { bestT = t; bestIdx = widx; }
+        }
+    }
+
+    {
+        V2 newP = desiredP;
+        if (bestIdx >= 0) {
+            Wall hit = g_walls[bestIdx];
+            if (hit.neighbor >= 0) {
+                g_current_sector = hit.neighbor;
+                ResolveCircleVsSolids(g_current_sector, &newP, g_player.radius);
+                g_player.x = newP.x; g_player.z = newP.z;
+                return;
+            }
+            ResolveCircleVsSolids(g_current_sector, &newP, g_player.radius);
+            g_player.x = newP.x; g_player.z = newP.z;
+            return;
+        }
+
+        ResolveCircleVsSolids(g_current_sector, &newP, g_player.radius);
+        g_player.x = newP.x; g_player.z = newP.z;
+    }
+}
+
+/* ------------------------- 3D portal renderer ----------------------------- */
+typedef struct {
+    int sector;
+    int clipL, clipR;
+    int prevSector;
+    int depth;
+    int topL, topR;   /* vertical clip top at edges */
+    int botL, botR;   /* vertical clip bottom at edges */
+} RenderTask;
+
+/* Interpolate per-column vertical clip within a task */
+static void TaskClipYAt(const RenderTask* t, int x, int* outTop, int* outBot) {
+    int w = t->clipR - t->clipL;
+    float a = (w != 0) ? (float)(x - t->clipL) / (float)w : 0.0f;
+    int top = (int)(t->topL + a * (t->topR - t->topL));
+    int bot = (int)(t->botL + a * (t->botR - t->botL));
+    if (outTop) *outTop = top;
+    if (outBot) *outBot = bot;
+}
+
+/* Perspective floor/ceiling fill clipped to portal trapezoid */
+static void FillSectorFloorCeilSpanClipped(const RenderTask* task, int cx, int cy, float focal) {
+    const Sector* sec = &g_sectors[task->sector];
+    const u32 FLOOR_BASE = 0x00262b30u;
+    const u32 CEIL_BASE = 0x001a2230u;
+
+    float dh_floor = g_player.eye_y - sec->floor_y;
+    float dh_ceil = sec->ceil_y - g_player.eye_y;
+
+    {
+        int x;
+        for (x = task->clipL; x <= task->clipR; ++x) {
+            int topY, botY;
+            TaskClipYAt(task, x, &topY, &botY);
+
+            /* Ceiling rows */
+            {
+                int ceilMax = topY; if (ceilMax > cy - 1) ceilMax = cy - 1;
+                if (dh_ceil > 1e-6f && ceilMax >= 0) {
+                    int y;
+                    for (y = 0; y <= ceilMax; ++y) {
+                        float denom = (float)(cy - y) + 0.5f;
+                        float depth, shade;
+                        u32 col;
+                        if (denom <= 0.0f) continue;
+                        depth = (dh_ceil * focal) / denom;
+                        shade = 1.0f / (1.0f + 0.15f * depth); if (shade < 0.25f) shade = 0.25f;
+                        col = ShadeRGB(CEIL_BASE, shade);
+                        {
+                            u32* row = (u32*)((u8*)g_back.memory + y * g_back.pitch);
+                            row[x] = col;
+                        }
+                    }
+                }
+            }
+
+            /* Floor rows */
+            {
+                int floorMin = botY; if (floorMin < cy) floorMin = cy;
+                if (dh_floor > 1e-6f && floorMin < g_back.height) {
+                    int y;
+                    for (y = floorMin; y < g_back.height; ++y) {
+                        float denom = (float)(y - cy) + 0.5f;
+                        float depth, shade;
+                        u32 col;
+                        if (denom <= 0.0f) continue;
+                        depth = (dh_floor * focal) / denom;
+                        shade = 1.0f / (1.0f + 0.15f * depth); if (shade < 0.25f) shade = 0.25f;
+                        col = ShadeRGB(FLOOR_BASE, shade);
+                        {
+                            u32* row = (u32*)((u8*)g_back.memory + y * g_back.pitch);
+                            row[x] = col;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Draw a single vertical edge clipped to current portal trapezoid */
+static void DrawEdgeClipped(int x, int yTop, int yBot, const RenderTask* task, int spanL, int spanR, u32 color) {
+    int tTop, tBot;
+    if (x < spanL || x > spanR) return;
+    TaskClipYAt(task, x, &tTop, &tBot);
+    if (yTop < tTop) yTop = tTop;
+    if (yBot > tBot) yBot = tBot;
+    if (yTop <= yBot) DrawLine(x, yTop, x, yBot, color);
+}
+
+static void Render3D(void) {
+    const float FOV_deg = 75.0f;
+    const float halfFOV = (float)(FOV_deg * (M_PI / 180.0f) * 0.5f);
+    const float nearPlane = 0.05f;
+
+    const int   cx = g_back.width / 2;
+    const int   cy = g_back.height / 2;
+    const float focal = (float)cx / tanf(halfFOV);
+
+    const float cosY = cosf(g_player.yaw);
+    const float sinY = sinf(g_player.yaw);
+
+    /* Background for uncovered pixels */
+    {
+        const u32 SKY_COLOR = 0x00203048u;
+        const u32 FLOOR_COLOR = 0x001a1f26u;
+        FillRect(0, 0, g_back.width, cy, SKY_COLOR);
+        FillRect(0, cy, g_back.width, g_back.height - cy, FLOOR_COLOR);
+    }
+
+    /* Portal traversal stack */
+    {
+        const int MAX_STACK = 64;
+        const int MAX_DEPTH = 16;
+        RenderTask stack[MAX_STACK]; int sp = 0;
+
+        {
+            RenderTask root;
+            root.sector = g_current_sector;
+            root.clipL = 0; root.clipR = g_back.width - 1;
+            root.prevSector = -1; root.depth = 0;
+            root.topL = 0; root.topR = 0;
+            root.botL = g_back.height - 1; root.botR = g_back.height - 1;
+            stack[sp++] = root;
+        }
+
+        while (sp > 0) {
+            RenderTask task = stack[--sp];
+            const Sector* sec = &g_sectors[task.sector];
+            const float ceilY = sec->ceil_y;
+            const float floorY = sec->floor_y;
+            int i;
+
+            if (task.clipL >= task.clipR) continue;
+            if (task.depth > MAX_DEPTH)   continue;
+
+            /* Fill floor/ceil inside portal trapezoid */
+            FillSectorFloorCeilSpanClipped(&task, cx, cy, focal);
+
+            for (i = 0; i < sec->wall_count; ++i) {
+                const Wall* w = &g_walls[sec->first_wall + i];
+
+                /* Translate to player */
+                float ax = w->a.x - g_player.x;
+                float az = w->a.z - g_player.z;
+                float bx = w->b.x - g_player.x;
+                float bz = w->b.z - g_player.z;
+
+                /* Rotate by -yaw (camera looks along +X') */
+                float xa = cosY * ax + sinY * az;   /* depth A */
+                float za = -sinY * ax + cosY * az;  /* lateral A */
+                float xb = cosY * bx + sinY * bz;   /* depth B */
+                float zb = -sinY * bx + cosY * bz;  /* lateral B */
+
+                /* Near-plane clip on depth (xa/xb) with lateral interpolation */
+                if (xa <= nearPlane && xb <= nearPlane) continue;
+                if (xa <= nearPlane || xb <= nearPlane) {
+                    if (xa < nearPlane && xb > nearPlane) {
+                        float t = (nearPlane - xa) / (xb - xa);
+                        xa = nearPlane;  za = za + t * (zb - za);
+                    }
+                    else if (xb < nearPlane && xa > nearPlane) {
+                        float t = (nearPlane - xb) / (xa - xb);
+                        xb = nearPlane;  zb = zb + t * (za - zb);
+                    }
+                    else {
+                        continue;
+                    }
+                }
+
+                /* Back-face cull SOLID walls only, using per-sector winding */
+                {
+                    float cross = xa * zb - xb * za;
+                    int isCCW = g_sector_is_ccw[task.sector];
+                    int back = isCCW ? (cross <= 0.0f) : (cross >= 0.0f);
+                    if (w->neighbor < 0 && back) continue;
+                }
+
+                /* Project to screen X */
+                {
+                    int sx1 = cx + (int)((za / xa) * focal);
+                    int sx2 = cx + (int)((zb / xb) * focal);
+
+                    /* Sort left -> right, carry depths and laterals */
+                    int   leftX = sx1, rightX = sx2;
+                    float leftD = xa, rightD = xb;
+                    float zL = za, zR = zb;
+                    if (rightX < leftX) {
+                        int ti = leftX; leftX = rightX; rightX = ti;
+                        {
+                            float tf;
+                            tf = leftD; leftD = rightD; rightD = tf;
+                            tf = zL;    zL = zR;         zR = tf;
+                        }
+                    }
+
+                    /* Horizontal cull/clip */
+                    if (rightX < task.clipL || leftX > task.clipR) continue;
+                    {
+                        int spanL = (leftX > task.clipL) ? leftX : task.clipL;
+                        int spanR = (rightX < task.clipR) ? rightX : task.clipR;
+                        if (spanR < spanL) continue;
+
+                        /* Perspective-correct vertical extents by interpolating 1/depth */
+                        {
+                            float invLeft = 1.0f / leftD;
+                            float invRight = 1.0f / rightD;
+                            float invDX = (float)(rightX - leftX);
+                            float invW = (invDX != 0.0f) ? (1.0f / invDX) : 1.0f;
+
+                            /* Precompute edges (for optional wireframe) using endpoint depths */
+                            {
+                                int yTop1 = cy - (int)(((ceilY - g_player.eye_y) * focal) / leftD);
+                                int yBottom1 = cy - (int)(((floorY - g_player.eye_y) * focal) / leftD);
+                                int yTop2 = cy - (int)(((ceilY - g_player.eye_y) * focal) / rightD);
+                                int yBottom2 = cy - (int)(((floorY - g_player.eye_y) * focal) / rightD);
+                                {
+                                    u32 edgeColor = (w->neighbor >= 0) ? 0x0044CCFFu : 0x00FF4444u;
+                                    DrawEdgeClipped(leftX, yTop1, yBottom1, &task, spanL, spanR, edgeColor);
+                                    DrawEdgeClipped(rightX, yTop2, yBottom2, &task, spanL, spanR, edgeColor);
+                                }
+
+                                /* Fill SOLID wall with perspective-correct heights */
+                                if (w->neighbor < 0) {
+                                    const u32 BASE = 0x00884444u;
+                                    int x;
+                                    for (x = spanL; x <= spanR; ++x) {
+                                        float t = (float)(x - leftX) * invW;
+                                        float invD = invLeft + t * (invRight - invLeft); /* 1/depth at x */
+                                        float depth = (invD > 1e-9f) ? (1.0f / invD) : 1e9f;
+
+                                        /* heights using invD to avoid re-divide jitter */
+                                        {
+                                            int yTop = cy - (int)(((ceilY - g_player.eye_y) * focal) * invD);
+                                            int yBot = cy - (int)(((floorY - g_player.eye_y) * focal) * invD);
+
+                                            int clipTop, clipBot;
+                                            TaskClipYAt(&task, x, &clipTop, &clipBot);
+                                            if (yTop < clipTop) yTop = clipTop;
+                                            if (yBot > clipBot) yBot = clipBot;
+
+                                            if (yTop <= yBot) {
+                                                float shade = 1.0f / (1.0f + 0.15f * depth);
+                                                if (shade < 0.35f) shade = 0.35f;
+                                                DrawVerticalSpan(x, yTop, yBot, ShadeRGB(BASE, shade));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                /* Enqueue neighbor through portal (build child trapezoid with inv-depth) */
+                                if (w->neighbor >= 0) {
+                                    if (spanR - spanL >= 2 && w->neighbor != task.prevSector && sp < MAX_STACK && task.depth + 1 <= MAX_DEPTH) {
+                                        float tL = (float)(spanL - leftX) * invW;
+                                        float tR = (float)(spanR - leftX) * invW;
+
+                                        float invDL = invLeft + tL * (invRight - invLeft);
+                                        float invDR = invLeft + tR * (invRight - invLeft);
+
+                                        int wTopL = cy - (int)(((ceilY - g_player.eye_y) * focal) * invDL);
+                                        int wBotL = cy - (int)(((floorY - g_player.eye_y) * focal) * invDL);
+                                        int wTopR = cy - (int)(((ceilY - g_player.eye_y) * focal) * invDR);
+                                        int wBotR = cy - (int)(((floorY - g_player.eye_y) * focal) * invDR);
+
+                                        {
+                                            int pTopL, pBotL, pTopR, pBotR;
+                                            int childTopL, childBotL, childTopR, childBotR;
+                                            TaskClipYAt(&task, spanL, &pTopL, &pBotL);
+                                            TaskClipYAt(&task, spanR, &pTopR, &pBotR);
+
+                                            childTopL = (wTopL > pTopL) ? wTopL : pTopL;
+                                            childBotL = (wBotL < pBotL) ? wBotL : pBotL;
+                                            childTopR = (wTopR > pTopR) ? wTopR : pTopR;
+                                            childBotR = (wBotR < pBotR) ? wBotR : pBotR;
+
+                                            if (childTopL <= childBotL && childTopR <= childBotR) {
+                                                RenderTask child;
+                                                child.sector = w->neighbor;
+                                                child.clipL = spanL; child.clipR = spanR;
+                                                child.prevSector = task.sector;
+                                                child.depth = task.depth + 1;
+                                                child.topL = childTopL; child.topR = childTopR;
+                                                child.botL = childBotL; child.botR = childBotR;
+                                                stack[sp++] = child;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ------------------------- 2D Map overlay --------------------------------- */
+static void DrawMap2D(void) {
+    const int origin_x = 190;
+    const int origin_y = g_back.height - 90;
+    const float S = 24.0f;
+
+    int s;
+    for (s = 0; s < (int)(sizeof(g_sectors) / sizeof(g_sectors[0])); ++s) {
+        Sector sec = g_sectors[s];
+        int i;
+        for (i = 0; i < sec.wall_count; ++i) {
+            Wall w = g_walls[sec.first_wall + i];
+            int x0 = origin_x + (int)(w.a.x * S);
+            int y0 = origin_y - (int)(w.a.z * S);
+            int x1 = origin_x + (int)(w.b.x * S);
+            int y1 = origin_y - (int)(w.b.z * S);
+            {
+                u32 color = (w.neighbor >= 0) ? 0x0044CCFFu : 0x00FF4444u;
+                DrawLine(x0, y0, x1, y1, color);
+            }
+        }
+    }
+
+    {
+        int px = origin_x + (int)(g_player.x * S);
+        int pz = origin_y - (int)(g_player.z * S);
+        u32 pcol = (g_current_sector == 0) ? 0x00FFAA00u : 0x0000FFFFu;
+        FillRect(px - 2, pz - 2, 5, 5, pcol);
+
+        {
+            int hx = origin_x + (int)((g_player.x + cosf(g_player.yaw) * 0.5f) * S);
+            int hz = origin_y - (int)((g_player.z + sinf(g_player.yaw) * 0.5f) * S);
+            DrawLine(px, pz, hx, hz, 0x0000FF00u);
+        }
+    }
+}
+
+/* ------------------------- Debug HUD -------------------------------------- */
+static void DrawDebugHUD(void) {
+    int cx = g_back.width / 2, cy = g_back.height / 2;
+    FillRect(cx - 2, cy - 2, 5, 5, 0x00FFFFFF);
+    DrawMap2D();
+}
+
+/* --------------------------------- WinMain -------------------------------- */
+int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+    WNDCLASS wc; ZeroMemory(&wc, sizeof(wc));
+    wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = "Portal FPS";
+
+    RegisterClass(&wc);
+    g_hWnd = CreateWindowEx(
+        0, wc.lpszClassName, "Portal FPS",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 960, 540,
+        0, 0, hInst, 0
+    );
+
+    {
+        RECT r; GetClientRect(g_hWnd, &r);
+        ResizeBackbuffer(&g_back, r.right - r.left, r.bottom - r.top);
+    }
+    InitSectorWinding();
+
+    g_hdc = GetDC(g_hWnd);
+    QueryPerformanceFrequency(&g_qpcFreq);
+    {
+        LARGE_INTEGER last; QueryPerformanceCounter(&last);
+
+        while (g_running) {
+            MSG m;
+            while (PeekMessage(&m, 0, 0, 0, PM_REMOVE)) {
+                if (m.message == WM_QUIT) g_running = 0;
+                else { TranslateMessage(&m); DispatchMessage(&m); }
+            }
+            if (!g_running) break;
+
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+                g_running = 0;
+            }
+            if (!g_mouse_captured) {
+                SHORT lmb = GetAsyncKeyState(VK_LBUTTON);
+                if (lmb & 0x0001) { CaptureMouse(g_hWnd); }
+            }
+
+            {
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                f32 dt = (f32)((double)(now.QuadPart - last.QuadPart) / (double)g_qpcFreq.QuadPart);
+                last = now;
+
+                /* Input -> desired delta, then collide/traverse with radius and slide */
+                {
+                    f32 dx = 0.0f, dz = 0.0f;
+                    V2 oldP, desiredP;
+                    UpdatePlayerIntent(dt, &dx, &dz);
+                    oldP.x = g_player.x; oldP.z = g_player.z;
+                    desiredP.x = g_player.x + dx; desiredP.z = g_player.z + dz;
+                    MoveWithPortalsAndSlide(oldP, desiredP);
+                }
+
+                Clear(0x00202020);
+
+                /* Render 3D view via portals (with solid-wall back-face culling) */
+                Render3D();
+
+                /* Overlay HUD + 2D map for debugging */
+                DrawDebugHUD();
+
+                PresentBackbuffer(g_hdc, &g_back);
+            }
+        }
+    }
+
+    ReleaseMouse();
+    ReleaseDC(g_hWnd, g_hdc);
+    return 0;
+}
